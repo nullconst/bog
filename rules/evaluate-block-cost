@@ -1,0 +1,125 @@
+POW_BITS_GENESIS='1307FFFF'
+
+POW_TARGET_SPACING=$((10 * 60))
+POW_TARGET_TIMESPAN=$((14 * 24 * 60 * 60))
+POW_DIFFICULTY_ADJUSTMENT_INTERVAL=$((${POW_TARGET_TIMESPAN} / ${POW_TARGET_SPACING}))
+
+function nonce_random() {
+	head -c 20 /dev/urandom | basenc --base16
+}
+
+function bits_to_target() {
+	local BITS=${1^^}
+	target_format $(printf 'scale=24;obase=16;ibase=16;%s\n' "${BITS:2} * (100 ^ (${BITS:0:2}-3))" | bc)
+}
+
+function target_format() {
+	local TARGET=${1^^}
+	printf '%40s' ${TARGET} | tr ' ' 0
+}
+
+function target_to_bits() {
+	local TARGET=${1^^}
+
+	local SIGNIFICAND
+	local INSIGNIFICANT
+	read -r SIGNIFICAND INSIGNIFICANT < <(printf 'obase=16;ibase=16;(%s/1)\n' ${TARGET} | bc | (
+		head -c6
+		printf ' '
+		cat -
+	))
+
+	local EXPONENT=$((${#INSIGNIFICANT} / 2 + 3))
+	if [[ $((${#INSIGNIFICANT} % 2)) -gt 0 ]]; then
+		EXPONENT=$((${EXPONENT} + 1))
+		SIGNIFICAND=${SIGNIFICAND%?}
+	fi
+
+	SIGNIFICAND=$(printf '%6s' ${SIGNIFICAND} | tr ' ' 0)
+	EXPONENT=$(printf '%2s' $(dec_to_hex ${EXPONENT}) | tr ' ' 0)
+
+	printf '%s%s' ${EXPONENT} ${SIGNIFICAND}
+}
+
+function bits_to_difficulty() {
+	local BITS=${1^^}
+	printf "scale=24;obase=16;ibase=16;%s/%s\n" $(bits_to_target ${POW_BITS_GENESIS}) $(bits_to_target ${BITS}) | bc
+}
+
+function target_to_work() {
+	local TARGET=${1^^}
+	printf "scale=24;obase=16;ibase=16;%s/%s\n" '(2^A0)' ${TARGET} | bc
+}
+
+function bits_to_work() {
+	local BITS=${1^^}
+	printf "scale=24;obase=16;ibase=16;%s/%s\n" '(2^A0)' $(bits_to_target ${BITS}) | bc
+}
+
+function get_count_timespan_target_chainwork_from_blocks() {
+	local BLOCK_HASH_LAST=${1}
+	local BLOCK_COUNT=${2}
+
+	local CHAINWORK=0
+	local TARGET=0
+	local BLOCK_TIME_FIRST
+	local BLOCK_TIME_LAST
+	local ACTUAL_BLOCK_COUNT=0
+	while read -r BLOCK_HASH BLOCK_TIME BLOCK_BITS; do
+		ACTUAL_BLOCK_COUNT=$((${ACTUAL_BLOCK_COUNT} + 1))
+		BLOCK_TIME_FIRST=${BLOCK_TIME}
+		if [[ -z "${BLOCK_TIME_LAST}" ]]; then
+			BLOCK_TIME_LAST=${BLOCK_TIME}
+		fi
+
+		CHAINWORK=$(printf "scale=24;obase=16;ibase=16;%s+%s\n" ${CHAINWORK} $(bits_to_work ${BLOCK_BITS}) | bc)
+		TARGET=$(printf "scale=24;obase=16;ibase=16;%s+%s\n" ${TARGET} $(bits_to_target ${BLOCK_BITS}) | bc)
+	done < <(git log \
+		--format='%H %ct %(trailers:key=Bits,valueonly,separator=%x2C)' \
+		-n ${BLOCK_COUNT} \
+		${BLOCK_HASH_LAST})
+
+	TARGET=$(printf "obase=16;ibase=16;%s/%s\n" ${TARGET} $(dec_to_hex ${ACTUAL_BLOCK_COUNT}) | bc)
+
+	echo ${ACTUAL_BLOCK_COUNT} $((${BLOCK_TIME_LAST} - ${BLOCK_TIME_FIRST})) ${TARGET} ${CHAINWORK}
+}
+
+function dec_to_hex() {
+	printf 'obase=16;ibase=10;%s\n' ${1} | bc
+}
+
+function hex_to_dec() {
+	printf 'obase=10;ibase=16;%s\n' ${1} | bc
+}
+
+function get_next_work_required() {
+	local BLOCK_HASH=${1}
+
+	local ACTUAL_COUNT
+	local ACTUAL_TIMESPAN
+	local ACTUAL_TARGET
+	local ACTUAL_CHAINWORK
+
+	read -r ACTUAL_COUNT ACTUAL_TIMESPAN ACTUAL_TARGET ACTUAL_CHAINWORK < <(get_count_timespan_target_chainwork_from_blocks ${BLOCK_HASH} ${POW_DIFFICULTY_ADJUSTMENT_INTERVAL})
+	if [[ ${ACTUAL_COUNT} -lt ${POW_DIFFICULTY_ADJUSTMENT_INTERVAL} ]]; then
+		echo ${POW_BITS_GENESIS}
+		return
+	fi
+
+	local TARGET_TIMESPAN=$(printf "%d*%d\n" ${POW_TARGET_SPACING} ${ACTUAL_COUNT} | bc)
+	local TARGET_TIMESPAN_LOWERBOUND=$((${TARGET_TIMESPAN} / 4))
+	local TARGET_TIMESPAN_UPPERBOUND=$((${TARGET_TIMESPAN} * 4))
+	if [[ ${ACTUAL_TIMESPAN} -lt ${TARGET_TIMESPAN_LOWERBOUND} ]]; then
+		ACTUAL_TIMESPAN=${TARGET_TIMESPAN_LOWERBOUND}
+	elif [[ ${ACTUAL_TIMESPAN} -gt ${TARGET_TIMESPAN_UPPERBOUND} ]]; then
+		ACTUAL_TIMESPAN=${TARGET_TIMESPAN_UPPERBOUND}
+	fi
+
+	local NEXT_TARGET=$(printf "obase=16;ibase=16;%s*%s/%s\n" ${ACTUAL_TARGET} $(dec_to_hex ${ACTUAL_TIMESPAN}) $(dec_to_hex ${TARGET_TIMESPAN}) | bc)
+	if [[ $(target_format ${NEXT_TARGET}) > $(bits_to_target ${POW_BITS_GENESIS}) ]]; then
+		NEXT_TARGET=$(bits_to_target ${POW_BITS_GENESIS})
+	fi
+	local NEXT_BITS=$(target_to_bits ${NEXT_TARGET})
+
+	echo ${NEXT_BITS}
+}

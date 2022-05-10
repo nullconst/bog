@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+
+__FILE__="$(readlink -f ${BASH_SOURCE[0]})"
+__DIR__="$(dirname ${__FILE__})"
+
+source ${__DIR__}/evaluate-block-cost
+
+# set -x
+function receive_blocks() {
+    local CHAIN_REF=${1}
+    local CURRENT_TIP_HASH=${2}
+    local PROPOSED_TIP_HASH=${3}
+    local FLAGS=${4}
+    local UPDATE_REFS
+    local REPORT_UPDATES
+
+    BLOCK_RANGE="${CURRENT_TIP_HASH}..${PROPOSED_TIP_HASH}"
+    if [[ ${CURRENT_TIP_HASH} == '0000000000000000000000000000000000000000' ]]; then
+        BLOCK_RANGE="${PROPOSED_TIP_HASH}"
+    elif [[ ${PROPOSED_TIP_HASH} == '0000000000000000000000000000000000000000' ]]; then
+        return 0
+    else
+        case ${FLAGS} in
+        update-refs) UPDATE_REFS=1 ;;
+        report-updated) [[ ${CHAIN_REF} == 'HEAD' ]] && REPORT_UPDATES=1 ;;
+        esac
+    fi
+
+    for BLOCK_HASH in $(git log --format='%H' --reverse ${BLOCK_RANGE}); do
+        if validate_block ${BLOCK_HASH}; then
+            if [[ -n "${UPDATE_REFS}" ]]; then
+                git update-ref ${CHAIN_REF} ${BLOCK_HASH}
+            elif [[ -n "${REPORT_UPDATES}" ]]; then
+                printf '%s UpdateTip: new best=%s height=%d\n' \
+                    "$(date --iso-8601=seconds)" \
+                    ${BLOCK_HASH} \
+                    $(git rev-list --count ${BLOCK_HASH})
+            fi
+        else
+            if [[ -n "${REPORT_UPDATES}" ]]; then
+                printf '%s RejectBlock: hash=%s height=%d reason="%s"\n' \
+                    "$(date --iso-8601=seconds)" \
+                    ${BLOCK_HASH} \
+                    $(git rev-list --count ${BLOCK_HASH}) \
+                    'cheap block'
+            fi
+            return 1
+        fi
+    done 2> >(awk '
+        BEGIN {IGNORECASE=1}
+        /invalid revision range/ {matches=1}
+        !matches {print $0}
+    ')
+
+    return 0
+}
+
+function validate_block() {
+    local BLOCK_HASH=$(target_format ${1^^})
+    local BLOCK_BITS=$(git show -s --format='%(trailers:key=Bits,valueonly,separator=%x2C)' ${BLOCK_HASH})
+    if [[ -z "${BLOCK_BITS}" ]]; then
+        return 1
+    fi
+
+    local BLOCK_TARGET=$(bits_to_target ${BLOCK_BITS})
+    if [[ "${BLOCK_HASH}" > "${BLOCK_TARGET}" ]]; then
+        return 2
+    fi
+
+    local BLOCK_PARENT_HASH=$(git show -s --format='%P' ${BLOCK_HASH})
+    local BLOCK_BITS_REQUIRED=$(get_next_work_required ${BLOCK_PARENT_HASH})
+    local BLOCK_TARGET_REQUIRED=$(bits_to_target ${BLOCK_BITS_REQUIRED})
+    if [[ "${BLOCK_TARGET}" != "${BLOCK_TARGET_REQUIRED}" ]]; then
+        return 3
+    fi
+
+    return 0
+}
+
+TRANSACTION_STAGE=${1}
+case ${1} in
+prepared)
+    while read -r CURRENT_TIP_HASH PROPOSED_TIP_HASH CHAIN_REF; do
+        receive_blocks ${CHAIN_REF} ${CURRENT_TIP_HASH} ${PROPOSED_TIP_HASH} || exit $?
+    done
+    ;;
+committed)
+    while read -r CURRENT_TIP_HASH PROPOSED_TIP_HASH CHAIN_REF; do
+        receive_blocks ${CHAIN_REF} ${CURRENT_TIP_HASH} ${PROPOSED_TIP_HASH} report-updated
+    done
+    ;;
+aborted)
+    while read -r CURRENT_TIP_HASH PROPOSED_TIP_HASH CHAIN_REF; do
+        receive_blocks ${CHAIN_REF} ${CURRENT_TIP_HASH} ${PROPOSED_TIP_HASH} update-refs
+    done
+    ;;
+esac

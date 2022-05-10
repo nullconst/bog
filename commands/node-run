@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+function sync_peers() {
+	local branch=$(git branch --show-current)
+	for remote in $(git remote); do
+		git stash push --quiet >/dev/null
+		git pull --quiet --rebase ${remote} ${branch}
+		git push --quiet ${remote} ${branch}
+		git stash pop --quiet >/dev/null
+	done
+}
+
+function generate_block() {
+	GIT_AUTHOR_DATE="$(date +'%s %z')" GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE" git commit --quiet \
+		--allow-empty \
+		-m "${BOG_COINBASE_ARBITRARY_DATA:-.}"
+}
+
+while :; do
+	sync_peers
+	generate_block
+done

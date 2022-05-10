@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+__FILE__="$(readlink -f ${BASH_SOURCE[0]})"
+__DIR__="$(dirname ${__FILE__})"
+
+source ${__DIR__}/evaluate-block-cost
+
+function generate_block() {
+	local BITS=$(get_next_work_required HEAD)
+	local BLOCK_HASH_MAX=$(bits_to_target ${BITS})
+
+	local HEADER_FILE="${1}"
+	local PARENT
+	local TREE
+
+	local T0=$(date '+%s')
+	local NOW=${T0}
+	local TNEXT_REPORT=$((${T0} + 10))
+	local ITERATION_COUNT=0
+
+	printf '%s GenerateBlock: height=%d target=%s difficulty=%0.4f\n' \
+		"$(date --iso-8601=seconds)" \
+		$(git rev-list --count HEAD) \
+		${BLOCK_HASH_MAX} \
+		$(hex_to_dec $(bits_to_difficulty ${BITS}))
+
+	local BLOCK_TEMPLATE_HASH=$(get_block_template "${HEADER_FILE}")
+	local NONCE=$(nonce_random)
+	while :; do
+		NOW=$(date '+%s')
+		for ((i = 0; i < 100; i++)); do
+			ITERATION_COUNT=$((${ITERATION_COUNT} + 1))
+
+			local BLOCK_HASH=$(create_block "${BLOCK_TEMPLATE_HASH}" ${BITS} ${NONCE})
+			if [[ "${BLOCK_HASH}" < "${BLOCK_HASH_MAX}" ]]; then
+				set_bits_and_nonce "${HEADER_FILE}" ${BITS} ${NONCE}
+				printf '%s FoundBlock: hash=%s rate=%sH/s\n' \
+					"$(date --iso-8601=seconds)" \
+					${BLOCK_HASH} \
+					"$(printf 'scale=2;%d/(%d-%d+1)\n' ${ITERATION_COUNT} ${NOW} ${T0} | bc)"
+
+				garbage_collect
+				return 0
+			fi
+			NONCE=$(target_format $(printf 'obase=16;ibase=16;%s+1\n' ${NONCE} | bc))
+		done
+
+		if [[ ${NOW} -gt ${TNEXT_REPORT} ]]; then
+			TNEXT_REPORT=$((${TNEXT_REPORT} + 10))
+			printf '%s GenerateBlock: height=%d target=%s rate=%sH/s\n' \
+				"$(date --iso-8601=seconds)" \
+				$(git rev-list --count HEAD) \
+				${BLOCK_HASH_MAX} \
+				$(printf 'scale=2;%d/(%d-%d)\n' ${ITERATION_COUNT} ${NOW} ${T0} | bc)
+		fi
+	done
+
+	garbage_collect
+	return 1
+}
+
+function get_block_template() {
+	local HEADER_FILE="${1}"
+
+	local IS_AMEND=$(ps -ocommand= -p $PPID | grep -e '--amend')
+	local TREE=$(git write-tree)
+	local PARENT
+	if [[ -n "${IS_AMEND}" ]]; then
+		PARENT=$(git show -s --format=%P HEAD)
+	else
+		PARENT=$(git rev-parse HEAD)
+	fi
+
+	git commit-tree -F "${HEADER_FILE}" ${PARENT:+-p ${PARENT}} ${TREE}
+}
+
+function create_block() {
+	local BLOCK_TEMPLATE_HASH=$1
+	local BITS=$2
+	local NONCE=$3
+
+	local BLOCK_HASH=$(git cat-file -p ${BLOCK_TEMPLATE_HASH} |
+		git interpret-trailers --if-exists replace --trailer Bits=${BITS} --trailer Nonce=${NONCE} |
+		git hash-object -t commit --stdin)
+
+	echo ${BLOCK_HASH^^}
+}
+
+function set_bits_and_nonce() {
+	local HEADER_FILE="${1}"
+	local BITS=${2}
+	local NONCE=${3}
+
+	git interpret-trailers --in-place --if-exists replace --trailer Bits=${BITS} --trailer Nonce=${NONCE} "${HEADER_FILE}"
+}
+
+function garbage_collect() {
+	git -c gc.reflogExpire=now gc --aggressive --prune=now
+}
+
+generate_block ${@}
+exit $?

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+rm -f .git/hooks/*
+
+ln -snrf rules/generate-expensive-blocks .git/hooks/commit-msg
+ln -snrf rules/reject-cheap-blocks .git/hooks/reference-transaction
